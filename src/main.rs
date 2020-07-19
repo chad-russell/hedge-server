@@ -34,6 +34,11 @@ async fn main() -> std::io::Result<()> {
 struct BacktestRequest {
     underlying: String,
     legs: Vec<BacktestRequestLeg>,
+
+    // TODO(chad): these only apply to short premium positions. Think of a better way to communicate strategy
+    take_profit: Option<f32>,
+    stop_loss: Option<f32>,
+    stop_at_day: Option<i32>,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -51,9 +56,10 @@ struct BacktestResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BacktestTrialResponse {
-    leg: BacktestRequestLeg,
     start_date: String,
     expiration_date: String,
+    underlying_start_price: Option<f32>,
+    strikes: Vec<Option<f32>>,
     pl: Vec<f32>,
 }
 
@@ -62,9 +68,9 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
     let mut response = BacktestResponse::default();
 
     let mut expiration_dates: Vec<String> = Vec::new();
-    let mut start_dates: Vec<Vec<String>> = Vec::new();
 
     for year in 2005..=2020 {
+        // for year in 2020..=2020 {
         let decoded = read_db_file(&year.to_string(), &req.underlying);
         if decoded.is_none() {
             return HttpResponse::Ok().json(format!(
@@ -78,20 +84,31 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
             day_to_check += 1;
         }
 
+        let mut loop_limit = 0;
         loop {
             if !decoded.contains_key(&day_to_check) {
                 break;
             }
 
+            loop_limit += 1;
+            if loop_limit > 365 {
+                break;
+            }
+
             let mut ed = Vec::new();
             for c in decoded[&day_to_check].contracts.iter() {
-                let exp_date = NaiveDate::from_num_days_from_ce(c.expiration_date).to_string();
+                let exp_date = NaiveDate::from_num_days_from_ce(c.expiration_date);
+                let exp_date = exp_date.to_string();
+
                 if !ed.contains(&exp_date) {
                     ed.push(exp_date);
                 }
             }
 
             ed.sort();
+            if ed.len() < 2 {
+                continue;
+            }
 
             let mut next_day_to_check = NaiveDate::parse_from_str(&ed[0], "%Y-%m-%d")
                 .unwrap()
@@ -116,69 +133,89 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
     expiration_dates.sort();
     expiration_dates.dedup();
 
-    start_dates = req
-        .legs
-        .iter()
-        .map(|leg| {
-            expiration_dates
-                .iter()
-                .map(|d| {
-                    let date = NaiveDate::parse_from_str(d, "%Y-%m-%d")
-                        .unwrap()
-                        .num_days_from_ce();
-                    let date = date - leg.dte; // TODO(chad): configurable number of days until expiration
-                    NaiveDate::from_num_days_from_ce(date).to_string()
-                })
-                .collect()
-        })
-        .collect();
-
     let mut db_cache = DbCache::default();
 
-    let mut aggregated_legs = Vec::new();
+    let max_dte = req.legs.iter().map(|l| l.dte).max().unwrap();
+    for (index, expiration_date) in expiration_dates.iter().enumerate() {
+        let expiration_date = NaiveDate::parse_from_str(expiration_date, "%Y-%m-%d").unwrap();
+        let start_date =
+            NaiveDate::from_num_days_from_ce(expiration_date.num_days_from_ce() - max_dte);
 
-    for (leg, dates_list) in req.legs.iter().zip(start_dates.iter()) {
-        for (date_index, (start_date, expiration_date)) in
-            dates_list.iter().zip(expiration_dates.iter()).enumerate()
-        {
-            let start_date = NaiveDate::parse_from_str(start_date, "%Y-%m-%d").unwrap();
-            let start_date_days = start_date.num_days_from_ce();
+        // println!(
+        //     "Running simulation for start_date: {}, expiration_date: {}",
+        //     start_date, expiration_date
+        // );
 
-            let expiration_date = NaiveDate::parse_from_str(expiration_date, "%Y-%m-%d").unwrap();
-            let expiration_date_days = expiration_date.num_days_from_ce();
+        // println!("{} / {}", index, expiration_dates.len());
 
-            println!(
-                "Running simulation for leg: {:?}, start_date: {}, expiration_date: {}",
-                leg,
-                start_date,
-                NaiveDate::from_num_days_from_ce(expiration_date_days)
-            );
+        let leg_strikes = req
+            .legs
+            .iter()
+            .map(|leg| {
+                db_cache
+                    .entry_closest_or_before(start_date.num_days_from_ce(), &req.underlying)
+                    .map(|db_entry| {
+                        if leg.is_call {
+                            let strike = find_strike_by_delta(
+                                &db_entry,
+                                leg.delta,
+                                start_date,
+                                expiration_date,
+                                true,
+                            );
+                            // if strike.is_none() {
+                            //     println!("Could not find strike for {} delta call starting at {} for expiration date {}", leg.delta, start_date, expiration_date);
+                            // } else {
+                            //     println!("Found strike for {} delta call starting at {} for expiration date {}", leg.delta, start_date, expiration_date);
+                            // }
+                            strike
+                        } else {
+                            let strike = find_strike_by_delta(
+                                &db_entry,
+                                leg.delta,
+                                start_date,
+                                expiration_date,
+                                false,
+                            );
+                            strike
+                        }
+                    })
+            })
+            .collect::<Vec<_>>();
 
-            let mut ag_leg_value = Vec::new();
+        if leg_strikes.iter().any(|ls| ls.is_none()) {
+            continue;
+        }
 
-            let strike = db_cache
-                .entry_closest_or_before(start_date.num_days_from_ce(), &req.underlying)
-                .map(|db_entry| {
-                    if leg.is_call {
-                        find_call_strike_by_delta(&db_entry, leg.delta, start_date, expiration_date)
-                    } else {
-                        find_put_strike_by_delta(&db_entry, leg.delta, start_date, expiration_date)
-                    }
-                });
+        let leg_strikes = leg_strikes.iter().map(|ls| ls.unwrap()).collect::<Vec<_>>();
 
-            match strike {
-                Some(strike) => {
-                    let mut trial = BacktestTrialResponse {
-                        leg: *leg,
-                        start_date: start_date.to_string(),
-                        expiration_date: expiration_date.to_string(),
-                        pl: Vec::new(),
-                    };
+        let mut trial = BacktestTrialResponse {
+            start_date: start_date.to_string(),
+            expiration_date: expiration_date.to_string(),
+            underlying_start_price: db_cache
+                .entry(start_date.num_days_from_ce(), &req.underlying)
+                .map(|db_entry| db_entry.underlying_price),
+            strikes: leg_strikes.clone(),
+            pl: Vec::new(),
+        };
 
-                    for date_days in start_date_days..expiration_date_days {
-                        // Look up the value of the leg on the day
-                        let date = NaiveDate::from_num_days_from_ce(date_days);
+        let mut premium_collected = None;
+        let mut stopped_out = None;
 
+        // if start_date == NaiveDate::from_ymd(2020, 6, 19) {
+        //     let _stopme = 3;
+        // }
+
+        // TODO(chad): take different dte per leg into account
+        for date_days in start_date.num_days_from_ce()..expiration_date.num_days_from_ce() {
+            let date = NaiveDate::from_num_days_from_ce(date_days);
+
+            let mut cost_day = 0.0;
+            let mut cost_day_failed = false;
+
+            for (leg_index, leg) in req.legs.iter().enumerate() {
+                match leg_strikes[leg_index] {
+                    Some(strike) => {
                         let contract = db_cache
                             .entry(date.num_days_from_ce(), &req.underlying)
                             .map(|db_entry| {
@@ -200,16 +237,84 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                             });
 
                         if let Some(Some(contract)) = contract {
-                            trial.pl.push(contract.last);
+                            cost_day += contract.mid();
+                        } else {
+                            cost_day_failed = true;
                         }
                     }
-
-                    response.trials.push(trial);
+                    None => (),
                 }
-                None => (),
             }
 
-            aggregated_legs.push(ag_leg_value);
+            if !cost_day_failed {
+                // if we have already stopped our loss or taken profit, simply use that
+                // TODO(chad): can probably skip a lot of things if we have already taken profits or stopped a loss
+                if let Some(stopped_out) = stopped_out {
+                    trial.pl.push(stopped_out);
+                    continue;
+                }
+
+                if let None = premium_collected {
+                    premium_collected = Some(cost_day);
+                }
+
+                let profit_on_day = premium_collected.map(|p| p - cost_day);
+
+                // Should we stop due to the day?
+                let days_until_expiration = expiration_date.num_days_from_ce() - date_days;
+                match (premium_collected, req.stop_at_day, stopped_out) {
+                    (Some(premium_collected), Some(sad), None) if days_until_expiration <= sad => {
+                        println!("Stopping at {} days", days_until_expiration);
+                        stopped_out = Some(cost_day);
+                    }
+                    _ => (),
+                }
+
+                // Should we take profits?
+                match (
+                    premium_collected,
+                    req.take_profit,
+                    profit_on_day,
+                    stopped_out,
+                ) {
+                    (Some(premium_collected), Some(rtp), Some(profit_on_day), None)
+                        if profit_on_day >= rtp * premium_collected =>
+                    {
+                        // println!("taking profits on {}", date);
+                        // take_profit = Some(profit_on_day);
+                        // stopped_out = Some(cost_day);
+                        stopped_out = Some(premium_collected - rtp * premium_collected);
+                    }
+                    _ => (),
+                }
+
+                // Should we stop loss?
+                match (premium_collected, req.stop_loss, profit_on_day, stopped_out) {
+                    (Some(premium_collected), Some(rsl), Some(profit_on_day), None)
+                        if profit_on_day < 0.0
+                            && profit_on_day.abs() >= (rsl * premium_collected).abs() =>
+                    {
+                        // println!("stopping loss on {} at {}", date, premium_collected - cost_day);
+                        // stop_loss = Some(profit_on_day);
+                        // stopped_out = Some(cost_day);
+                        stopped_out = Some(premium_collected + rsl * premium_collected);
+                    }
+                    _ => (),
+                }
+
+                if stopped_out.is_some() {
+                    trial.pl.push(stopped_out.unwrap());
+                } else if stopped_out.is_none() && cost_day > 0.0 {
+                    trial.pl.push(cost_day);
+                    continue;
+                }
+            } else if let Some(&last) = trial.pl.last() {
+                trial.pl.push(last);
+            }
+        }
+
+        if trial.strikes.iter().all(|s| s.is_some()) && !trial.pl.is_empty() {
+            response.trials.push(trial);
         }
     }
 
@@ -289,58 +394,34 @@ async fn find_delta(req: HttpRequest) -> impl Responder {
 
     let exp_date = NaiveDate::from_num_days_from_ce(decoded.contracts[0].expiration_date);
 
-    let call_strike = find_call_strike_by_delta(&decoded, delta, sim_date, exp_date);
-    let put_strike = find_put_strike_by_delta(&decoded, delta, sim_date, exp_date);
+    let call_strike = find_strike_by_delta(&decoded, delta, sim_date, exp_date, true);
+    let put_strike = find_strike_by_delta(&decoded, delta, sim_date, exp_date, false);
 
     format!(
-        "The price of {} on {} for the {} expiration cycle was: {}. The {} delta call option's strike price is: {}, and the {} delta put option's strike price is: {}\n",
+        "The price of {} on {} for the {} expiration cycle was: {}. The {} delta call option's strike price is: {:?}, and the {} delta put option's strike price is: {:?}\n",
         symbol, sim_date, exp_date, decoded.underlying_price, delta, call_strike, delta, put_strike,
     )
 }
 
-fn find_call_strike_by_delta(
+fn find_strike_by_delta(
     entry: &DbEntry,
     delta: f32,
     sim_date: NaiveDate,
     exp_date: NaiveDate,
-) -> f32 {
-    let mut strike = std::f32::INFINITY;
-
-    for contract in entry.contracts.iter() {
-        let cr = ContractResponse::from(contract, entry.underlying_price, sim_date);
-
-        if cr.is_call
-            && cr.delta <= delta / 100.0
-            && cr.expiration_date == exp_date
-            && cr.strike < strike
-        {
-            strike = cr.strike;
-        }
-    }
-
-    strike
-}
-
-fn find_put_strike_by_delta(
-    entry: &DbEntry,
-    delta: f32,
-    sim_date: NaiveDate,
-    exp_date: NaiveDate,
-) -> f32 {
-    let mut strike = std::f32::NEG_INFINITY;
-    for contract in entry.contracts.iter() {
-        let cr = ContractResponse::from(contract, entry.underlying_price, sim_date);
-
-        if !cr.is_call
-            && cr.delta <= delta / 100.0
-            && cr.expiration_date == exp_date
-            && cr.strike > strike
-        {
-            strike = cr.strike;
-        }
-    }
-
-    strike
+    is_call: bool,
+) -> Option<f32> {
+    entry
+        .contracts
+        .iter()
+        .filter(|contract| {
+            let cr = ContractResponse::from(contract, entry.underlying_price, sim_date);
+            cr.is_call == is_call
+                && cr.delta <= (delta + 0.3)
+                && cr.delta >= (delta - 0.3)
+                && cr.expiration_date == exp_date
+        })
+        .map(|cr| cr.strike)
+        .next()
 }
 
 fn find_call_contract_by_strike(
@@ -497,7 +578,7 @@ impl Contract {
                 put_price(vol, spot, self.strike, t)
             };
 
-            let eps = (theo_price - self.last).abs();
+            let eps = (theo_price - self.mid()).abs();
             if eps < min_eps {
                 min_eps = eps;
                 closest_vol = vol;
@@ -505,6 +586,10 @@ impl Contract {
         }
 
         closest_vol
+    }
+
+    fn mid(&self) -> f32 {
+        (self.bid + self.ask) / 2.0
     }
 }
 
@@ -609,5 +694,9 @@ impl ContractResponse {
             vega,
             rho,
         }
+    }
+
+    fn mid(&self) -> f32 {
+        (self.bid + self.ask) / 2.0
     }
 }
