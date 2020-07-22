@@ -43,6 +43,7 @@ struct BacktestRequest {
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 struct BacktestRequestLeg {
+    contracts: i32,
     is_call: bool,
     is_buy: bool,
     delta: f32,
@@ -73,10 +74,12 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
         // for year in 2020..=2020 {
         let decoded = read_db_file(&year.to_string(), &req.underlying);
         if decoded.is_none() {
-            return HttpResponse::Ok().json(format!(
-                "Failed to read db file for {} {}",
-                year, req.underlying
-            ));
+            continue;
+
+            // return HttpResponse::Ok().json(format!(
+            //     "Failed to read db file for {} {}",
+            //     year, req.underlying
+            // ));
         }
         let decoded = decoded.unwrap();
         let mut day_to_check = NaiveDate::from_ymd(year, 1, 1).num_days_from_ce();
@@ -237,7 +240,12 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                             });
 
                         if let Some(Some(contract)) = contract {
-                            cost_day += contract.mid();
+                            if leg.is_buy {
+                                cost_day -= contract.mid() * leg.contracts as f32;
+                            }
+                            else {
+                                cost_day += contract.mid() * leg.contracts as f32;
+                            }
                         } else {
                             cost_day_failed = true;
                         }
@@ -262,8 +270,8 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
 
                 // Should we stop due to the day?
                 let days_until_expiration = expiration_date.num_days_from_ce() - date_days;
-                match (premium_collected, req.stop_at_day, stopped_out) {
-                    (Some(premium_collected), Some(sad), None) if days_until_expiration <= sad => {
+                match (req.stop_at_day, stopped_out) {
+                    (Some(sad), None) if days_until_expiration <= sad => {
                         println!("Stopping at {} days", days_until_expiration);
                         stopped_out = Some(cost_day);
                     }
@@ -304,7 +312,7 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
 
                 if stopped_out.is_some() {
                     trial.pl.push(stopped_out.unwrap());
-                } else if stopped_out.is_none() && cost_day > 0.0 {
+                } else if stopped_out.is_none() {
                     trial.pl.push(cost_day);
                     continue;
                 }
@@ -416,8 +424,8 @@ fn find_strike_by_delta(
         .filter(|contract| {
             let cr = ContractResponse::from(contract, entry.underlying_price, sim_date);
             cr.is_call == is_call
-                && cr.delta <= (delta + 0.3)
-                && cr.delta >= (delta - 0.3)
+                && cr.delta <= (delta + 0.03)
+                && cr.delta >= (delta - 0.03)
                 && cr.expiration_date == exp_date
         })
         .map(|cr| cr.strike)
