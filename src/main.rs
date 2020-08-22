@@ -25,6 +25,7 @@ async fn main() -> std::io::Result<()> {
             .service(find_delta)
             .service(backtest)
     })
+    // .bind("0.0.0.1:8000")?
     .bind("127.0.0.1:8000")?
     .run()
     .await
@@ -139,7 +140,7 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
     let mut db_cache = DbCache::default();
 
     let max_dte = req.legs.iter().map(|l| l.dte).max().unwrap();
-    for (index, expiration_date) in expiration_dates.iter().enumerate() {
+    for expiration_date in expiration_dates.iter() {
         let expiration_date = NaiveDate::parse_from_str(expiration_date, "%Y-%m-%d").unwrap();
         let start_date =
             NaiveDate::from_num_days_from_ce(expiration_date.num_days_from_ce() - max_dte);
@@ -242,8 +243,7 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                         if let Some(Some(contract)) = contract {
                             if leg.is_buy {
                                 cost_day -= contract.mid() * leg.contracts as f32;
-                            }
-                            else {
+                            } else {
                                 cost_day += contract.mid() * leg.contracts as f32;
                             }
                         } else {
@@ -468,13 +468,13 @@ fn find_put_contract_by_strike(
 async fn option_chain_for_symbol_and_date(req: HttpRequest) -> impl Responder {
     let symbol = req.match_info().get("symbol").unwrap();
 
-    // let exp_date = req.match_info().get("exp_date").unwrap();
-    // let exp_date = NaiveDate::parse_from_str(exp_date, "%Y-%m-%d").unwrap();
+    let exp_date = req.match_info().get("exp_date").unwrap();
+    let exp_date = NaiveDate::parse_from_str(exp_date, "%Y-%m-%d").unwrap();
 
     let sim_date = req.match_info().get("sim_date").unwrap();
     let sim_date = NaiveDate::parse_from_str(sim_date, "%Y-%m-%d").unwrap();
 
-    // let strike = req.match_info().get("strike").unwrap();
+    let strike = req.match_info().get("strike").unwrap();
 
     let decoded = read_db_file(&sim_date.year().to_string(), symbol);
     if decoded.is_none() {
@@ -486,10 +486,10 @@ async fn option_chain_for_symbol_and_date(req: HttpRequest) -> impl Responder {
     let contracts = decoded
         .contracts
         .iter()
-        //.filter(|c| {
-        ////c.strike == strike.parse::<f32>().unwrap()
-        ////&& c.expiration_date == exp_date.num_days_from_ce()
-        //})
+        .filter(|c| {
+            c.strike == strike.parse::<f32>().unwrap()
+                && c.expiration_date == exp_date.num_days_from_ce()
+        })
         .map(|c| ContractResponse::from(c, decoded.underlying_price, sim_date))
         .collect::<Vec<_>>();
 
@@ -528,56 +528,14 @@ struct Contract {
 }
 
 impl Contract {
-    /// Use the Newton-Rhapson method to calculate implied volatility, using vega as the derivative
-    // todo(chad): don't use dte here, accept a simulation date instead
-    // fn implied_volatility(&self, spot: f32, t: f32) -> f32 {
-    //     let mut vol = 0.5;
-
-    //     let mut eps = 1.0;
-    //     let tol = 0.001;
-
-    //     let max_iter = 1000;
-    //     let mut iter = 0;
-
-    //     // if self.is_call && self.strike == 175.0 && self.ask == 207.75 {
-    //     //     let stopme = 3;
-    //     // }
-
-    //     while eps > tol {
-    //         iter += 1;
-    //         if iter > max_iter {
-    //             break;
-    //         }
-
-    //         let orig_vol = vol;
-
-    //         let (d1, _) = d(vol, spot, self.strike, t);
-    //         let function_value = call_price(vol, spot, self.strike, t) - self.last;
-
-    //         let vega = spot * npdf(d1) * t.sqrt();
-    //         vol -= function_value / vega;
-
-    //         eps = ((vol - orig_vol) / orig_vol).abs();
-    //     }
-
-    //     if self.strike == 360.0 && self.is_call && self.expiration_date == NaiveDate::from_ymd(2020, 8, 21).num_days_from_ce() {
-    //         println!("implied volatility for the one you care about: {}", vol);
-    //     }
-
-    //     // assert!(!vol.is_nan());
-    //     // assert!(vol != std::f32::INFINITY);
-    //     // assert!(vol != std::f32::NEG_INFINITY);
-
-    //     vol
-    // }
-
     fn implied_volatility(&self, spot: f32, t: f32) -> f32 {
         let mut closest_vol = 0.0;
 
         let mut min_eps = std::f32::INFINITY;
+        let threshold_eps = 0.005;
 
         let mut vol = 0.0;
-        while vol < 1.0 {
+        while vol < 3.0 {
             vol += 0.01;
 
             let theo_price = if self.is_call {
@@ -590,6 +548,10 @@ impl Contract {
             if eps < min_eps {
                 min_eps = eps;
                 closest_vol = vol;
+            }
+
+            if eps < threshold_eps {
+                return vol;
             }
         }
 
@@ -606,7 +568,7 @@ fn d(sigma: f32, spot: f32, strike: f32, t: f32) -> (f32, f32) {
     let r = 0.0;
     let q = 0.0;
 
-    let d1 = ((spot / strike).ln() + t * (r - q + (sigma * sigma / 2.0))) / (sigma * t.sqrt());
+    let d1 = ((spot / strike).ln() + t * (r - q + sigma * sigma / 2.0)) / (sigma * t.sqrt());
     let d2 = d1 - sigma * t.sqrt();
 
     (d1, d2)
