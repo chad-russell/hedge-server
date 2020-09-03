@@ -36,16 +36,26 @@ struct BacktestRequest {
     underlying: String,
     legs: Vec<BacktestRequestLeg>,
 
-    // TODO(chad): these only apply to short premium positions. Think of a better way to communicate strategy
-    take_profit: Option<f32>,
-    stop_loss: Option<f32>,
+    take_profit_perc: Option<f32>,
+    take_profit_dollars: Option<f32>,
+
+    stop_loss_perc: Option<f32>,
+    stop_loss_dollars: Option<f32>,
+
     stop_at_day: Option<i32>,
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+enum ContractType {
+    Call,
+    Put,
+    Equity,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 struct BacktestRequestLeg {
     contracts: i32,
-    is_call: bool,
+    contract_type: ContractType,
     is_buy: bool,
     delta: f32,
     dte: i32,
@@ -65,6 +75,11 @@ struct BacktestTrialResponse {
     pl: Vec<f32>,
 }
 
+enum ContractOrUnderlying {
+    Contract(ContractResponse),
+    Underlying(f32),
+}
+
 #[post("/backtest")]
 async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
     let mut response = BacktestResponse::default();
@@ -76,12 +91,8 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
         let decoded = read_db_file(&year.to_string(), &req.underlying);
         if decoded.is_none() {
             continue;
-
-            // return HttpResponse::Ok().json(format!(
-            //     "Failed to read db file for {} {}",
-            //     year, req.underlying
-            // ));
         }
+
         let decoded = decoded.unwrap();
         let mut day_to_check = NaiveDate::from_ymd(year, 1, 1).num_days_from_ce();
         while !decoded.contains_key(&day_to_check) {
@@ -158,8 +169,8 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
             .map(|leg| {
                 db_cache
                     .entry_closest_or_before(start_date.num_days_from_ce(), &req.underlying)
-                    .map(|db_entry| {
-                        if leg.is_call {
+                    .map(|db_entry| match leg.contract_type {
+                        ContractType::Call => {
                             let strike = find_strike_by_delta(
                                 &db_entry,
                                 leg.delta,
@@ -167,13 +178,9 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                                 expiration_date,
                                 true,
                             );
-                            // if strike.is_none() {
-                            //     println!("Could not find strike for {} delta call starting at {} for expiration date {}", leg.delta, start_date, expiration_date);
-                            // } else {
-                            //     println!("Found strike for {} delta call starting at {} for expiration date {}", leg.delta, start_date, expiration_date);
-                            // }
                             strike
-                        } else {
+                        }
+                        ContractType::Put => {
                             let strike = find_strike_by_delta(
                                 &db_entry,
                                 leg.delta,
@@ -183,6 +190,7 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                             );
                             strike
                         }
+                        ContractType::Equity => Some(db_entry.underlying_price / 100.0),
                     })
             })
             .collect::<Vec<_>>();
@@ -222,29 +230,45 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                     Some(strike) => {
                         let contract = db_cache
                             .entry(date.num_days_from_ce(), &req.underlying)
-                            .map(|db_entry| {
-                                if leg.is_call {
-                                    find_call_contract_by_strike(
-                                        &db_entry,
-                                        strike,
-                                        date,
-                                        expiration_date,
-                                    )
-                                } else {
-                                    find_put_contract_by_strike(
-                                        &db_entry,
-                                        strike,
-                                        date,
-                                        expiration_date,
-                                    )
-                                }
+                            .map(|db_entry| match leg.contract_type {
+                                ContractType::Call => find_call_contract_by_strike(
+                                    &db_entry,
+                                    strike,
+                                    date,
+                                    expiration_date,
+                                )
+                                .map(|e| ContractOrUnderlying::Contract(e)),
+                                ContractType::Put => find_put_contract_by_strike(
+                                    &db_entry,
+                                    strike,
+                                    date,
+                                    expiration_date,
+                                )
+                                .map(|e| ContractOrUnderlying::Contract(e)),
+                                ContractType::Equity => Some(ContractOrUnderlying::Underlying(
+                                    db_entry.underlying_price / 100.0,
+                                )),
                             });
 
                         if let Some(Some(contract)) = contract {
                             if leg.is_buy {
-                                cost_day -= contract.mid() * leg.contracts as f32;
+                                match contract {
+                                    ContractOrUnderlying::Contract(contract) => {
+                                        cost_day -= contract.mid() * leg.contracts as f32;
+                                    }
+                                    ContractOrUnderlying::Underlying(price) => {
+                                        cost_day -= price * leg.contracts as f32;
+                                    }
+                                }
                             } else {
-                                cost_day += contract.mid() * leg.contracts as f32;
+                                match contract {
+                                    ContractOrUnderlying::Contract(contract) => {
+                                        cost_day += contract.mid() * leg.contracts as f32;
+                                    }
+                                    ContractOrUnderlying::Underlying(price) => {
+                                        cost_day += price * leg.contracts as f32;
+                                    }
+                                }
                             }
                         } else {
                             cost_day_failed = true;
@@ -272,40 +296,49 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                 let days_until_expiration = expiration_date.num_days_from_ce() - date_days;
                 match (req.stop_at_day, stopped_out) {
                     (Some(sad), None) if days_until_expiration <= sad => {
-                        println!("Stopping at {} days", days_until_expiration);
                         stopped_out = Some(cost_day);
                     }
                     _ => (),
                 }
 
-                // Should we take profits?
-                match (
-                    premium_collected,
-                    req.take_profit,
-                    profit_on_day,
-                    stopped_out,
-                ) {
-                    (Some(premium_collected), Some(rtp), Some(profit_on_day), None)
-                        if profit_on_day >= rtp * premium_collected =>
+                // Take profits due to percentage?
+                match (premium_collected, req.take_profit_perc, profit_on_day) {
+                    (Some(premium_collected), Some(rtp), Some(profit_on_day))
+                        if profit_on_day > 0.0
+                            && profit_on_day.abs() >= (rtp * premium_collected).abs() =>
                     {
-                        // println!("taking profits on {}", date);
-                        // take_profit = Some(profit_on_day);
-                        // stopped_out = Some(cost_day);
-                        stopped_out = Some(premium_collected - rtp * premium_collected);
+                        stopped_out = Some(cost_day);
                     }
                     _ => (),
                 }
 
-                // Should we stop loss?
-                match (premium_collected, req.stop_loss, profit_on_day, stopped_out) {
-                    (Some(premium_collected), Some(rsl), Some(profit_on_day), None)
+                // Take profits due to dollars?
+                match (req.take_profit_dollars, profit_on_day) {
+                    (Some(rtp), Some(profit_on_day))
+                        if profit_on_day > 0.0 && profit_on_day >= rtp =>
+                    {
+                        stopped_out = Some(cost_day);
+                    }
+                    _ => (),
+                }
+
+                // Stop loss due to percentage?
+                match (premium_collected, req.stop_loss_perc, profit_on_day) {
+                    (Some(premium_collected), Some(rsl), Some(profit_on_day))
                         if profit_on_day < 0.0
                             && profit_on_day.abs() >= (rsl * premium_collected).abs() =>
                     {
-                        // println!("stopping loss on {} at {}", date, premium_collected - cost_day);
-                        // stop_loss = Some(profit_on_day);
-                        // stopped_out = Some(cost_day);
-                        stopped_out = Some(premium_collected + rsl * premium_collected);
+                        stopped_out = Some(cost_day);
+                    }
+                    _ => (),
+                }
+
+                // Stop loss due to percentage?
+                match (req.stop_loss_dollars, profit_on_day) {
+                    (Some(rsl), Some(profit_on_day))
+                        if profit_on_day < 0.0 && profit_on_day.abs() >= rsl.abs() =>
+                    {
+                        stopped_out = Some(cost_day);
                     }
                     _ => (),
                 }
@@ -314,7 +347,6 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                     trial.pl.push(stopped_out.unwrap());
                 } else if stopped_out.is_none() {
                     trial.pl.push(cost_day);
-                    continue;
                 }
             } else if let Some(&last) = trial.pl.last() {
                 trial.pl.push(last);
@@ -424,8 +456,8 @@ fn find_strike_by_delta(
         .filter(|contract| {
             let cr = ContractResponse::from(contract, entry.underlying_price, sim_date);
             cr.is_call == is_call
-                && cr.delta <= (delta + 0.03)
-                && cr.delta >= (delta - 0.03)
+                && cr.delta <= (delta + 0.04)
+                && cr.delta >= (delta - 0.04)
                 && cr.expiration_date == exp_date
         })
         .map(|cr| cr.strike)
