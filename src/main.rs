@@ -1,3 +1,5 @@
+extern crate actix_cors;
+extern crate actix_web;
 extern crate bincode;
 extern crate chrono;
 extern crate rand;
@@ -9,6 +11,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::str;
 
+use actix_cors::Cors;
 use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 
 use chrono::{Datelike, NaiveDate};
@@ -21,11 +24,12 @@ use statrs::distribution::{Continuous, Normal, Univariate};
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
+            .wrap(Cors::new().finish())
             .service(option_chain_for_symbol_and_date)
             .service(find_delta)
             .service(backtest)
     })
-    // .bind("0.0.0.1:8000")?
+    //.bind("0.0.0.1:8000")?
     .bind("127.0.0.1:8000")?
     .run()
     .await
@@ -120,10 +124,10 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                 }
             }
 
-            ed.sort();
             if ed.len() < 2 {
                 continue;
             }
+            ed.sort();
 
             let mut next_day_to_check = NaiveDate::parse_from_str(&ed[0], "%Y-%m-%d")
                 .unwrap()

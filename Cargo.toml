@@ -5,6 +5,7 @@ authors = ["Chad Russell <chaddouglasrussell@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+actix-cors = "0.4.1"
 actix-web = { version = "3.0.0-alpha.2", features=["rustls"] }
 actix-rt = "1.1"
 actix-http = "2.0.0-alpha.4"
