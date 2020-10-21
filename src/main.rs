@@ -74,8 +74,8 @@ struct BacktestRequestLeg {
     contracts: i32,
     contract_type: ContractType,
     is_buy: bool,
-    delta: f32,
-    dte: i32,
+    delta: Option<f32>,
+    dte: Option<i32>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1276,7 +1276,14 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
 
     let mut db_cache = DbCache::default();
 
-    let max_dte = req.legs.iter().map(|l| l.dte).max().unwrap();
+    let max_dte = req
+        .legs
+        .iter()
+        .map(|l| l.dte)
+        .filter(|dte| dte.is_some())
+        .map(|dte| dte.unwrap())
+        .max()
+        .unwrap();
     for expiration_date in expiration_dates.iter() {
         let expiration_date = NaiveDate::parse_from_str(expiration_date, "%Y-%m-%d").unwrap();
         let start_date =
@@ -1299,7 +1306,7 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                         ContractType::Call => {
                             let strike = find_strike_by_delta(
                                 &db_entry,
-                                leg.delta,
+                                leg.delta.unwrap(),
                                 start_date,
                                 expiration_date,
                                 true,
@@ -1309,7 +1316,7 @@ async fn backtest(req: web::Json<BacktestRequest>) -> impl Responder {
                         ContractType::Put => {
                             let strike = find_strike_by_delta(
                                 &db_entry,
-                                leg.delta,
+                                leg.delta.unwrap(),
                                 start_date,
                                 expiration_date,
                                 false,
