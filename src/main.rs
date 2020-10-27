@@ -220,8 +220,15 @@ struct PolygonLast {
 #[serde(rename_all = "camelCase")]
 struct TDAmeritradeOptionsResponse {
     symbol: String,
+    underlying: TDAmeritradeUnderlying,
     put_exp_date_map: HashMap<String, HashMap<String, Vec<OptionModel>>>,
     call_exp_date_map: HashMap<String, HashMap<String, Vec<OptionModel>>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TDAmeritradeUnderlying {
+    last: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -317,6 +324,28 @@ async fn get_chain_impl(
                 .map(|(key, value)| {
                     let mut value = value[0].clone();
                     value.volatility = value.volatility.map(|v| v / 100.0);
+
+                    let compute_volatility = match value.volatility {
+                        None => true,
+                        Some(f) if f.is_nan() => true,
+                        _ => false,
+                    };
+                    if compute_volatility {
+                        let dte = parsed_date - chrono::offset::Utc::now().naive_utc().date();
+                        let dte = dte.num_days() as usize;
+                        let t = dte as f32 / 365.0; // todo(chad): 365 or 252??
+
+                        let volatility = implied_volatility(
+                            response.underlying.last.unwrap() as _,
+                            key.parse::<f32>().unwrap(),
+                            false,
+                            value.last.unwrap() as _,
+                            t,
+                        );
+
+                        value.volatility = Some(volatility as f64);
+                    }
+
                     (key.clone(), value)
                 })
                 .collect();
@@ -337,6 +366,28 @@ async fn get_chain_impl(
                 .map(|(key, value)| {
                     let mut value = value[0].clone();
                     value.volatility = value.volatility.map(|v| v / 100.0);
+
+                    let compute_volatility = match value.volatility {
+                        None => true,
+                        Some(f) if f.is_nan() => true,
+                        _ => false,
+                    };
+                    if compute_volatility {
+                        let dte = parsed_date - chrono::offset::Utc::now().naive_utc().date();
+                        let dte = dte.num_days() as usize;
+                        let t = dte as f32 / 365.0; // todo(chad): 365 or 252??
+
+                        let volatility = implied_volatility(
+                            response.underlying.last.unwrap() as _,
+                            key.parse::<f32>().unwrap(),
+                            true,
+                            value.last.unwrap() as _,
+                            t,
+                        );
+
+                        value.volatility = Some(volatility as f64);
+                    }
+
                     (key.clone(), value)
                 })
                 .collect();
@@ -572,7 +623,10 @@ async fn analyze(
                 }
             };
 
-            contract_date_map.get(&(serde_json::Value::from(p.strike_price.unwrap()).to_string()))
+            let found = contract_date_map
+                .get(&(serde_json::Value::from(p.strike_price.unwrap()).to_string()));
+
+            found.cloned()
         })
         .filter(|p| p.is_some())
         .map(|e| e.unwrap())
@@ -747,17 +801,30 @@ async fn analyze(
         );
     }
 
-    let daily_distribution_index_pop =
-        (-response.max_loss / (response.max_gain - response.max_loss) * 100.0).round() as usize;
-    let daily_distribution_index_p50 = ((response.max_gain / 2.0 - response.max_loss)
+    let mut daily_distribution_index_pop =
+        (-response.max_loss / (response.max_gain - response.max_loss) * 100.0).round() as i64;
+    if daily_distribution_index_pop < 0 {
+        daily_distribution_index_pop = 0;
+    }
+    if daily_distribution_index_pop > 99 {
+        daily_distribution_index_pop = 99;
+    }
+
+    let mut daily_distribution_index_p50 = ((response.max_gain / 2.0 - response.max_loss)
         / (response.max_gain - response.max_loss)
         * 100.0)
-        .round() as usize;
+        .round() as i64;
+    if daily_distribution_index_p50 < 0 {
+        daily_distribution_index_p50 = 0;
+    }
+    if daily_distribution_index_p50 > 99 {
+        daily_distribution_index_p50 = 99;
+    }
 
     response.pop =
-        response.daily_distributions.last().unwrap()[daily_distribution_index_pop] * 100.0;
+        response.daily_distributions.last().unwrap()[daily_distribution_index_pop as usize] * 100.0;
     response.p50 =
-        response.daily_distributions.last().unwrap()[daily_distribution_index_p50] * 100.0;
+        response.daily_distributions.last().unwrap()[daily_distribution_index_p50 as usize] * 100.0;
 
     HttpResponse::Ok().json(response)
 }
