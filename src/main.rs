@@ -183,7 +183,7 @@ enum ContractOrUnderlying {
 struct IVolatilityRecord {
     symbol: String,
     stock_id: Option<i64>,
-    expirationDate: String,
+    expiration_date: String,
     strike: f64,
     #[serde(rename = "type")]
     type_: String,
@@ -277,29 +277,13 @@ async fn last_price_for(client: &client::Client, symbol: &str) -> f32 {
     panic!();
 }
 
-async fn get_chain_impl(
+async fn get_tda_chain(
+    client: &client::Client,
     symbol: &str,
-    cache: &web::Data<CHashMap<String, ChainResponse>>,
-) -> ChainResponse {
-    // Try to look up the result in the cache
-    match cache.get(symbol) {
-        Some(entry) => {
-            let duration = chrono::offset::Utc::now().naive_utc() - entry.timestamp;
-            if duration < chrono::Duration::minutes(5) {
-                return entry.clone();
-            }
-        }
-        None => {}
-    }
-
-    let client = client::Client::default();
-
-    // let spot_price = last_price_for(&client, symbol).await;
-
-    // HashMap<i64, HashMap<F64String, OptionModel>>
-    // let mut call_exp_date_map = HashMap::new();
-    // let mut put_exp_date_map = HashMap::new();
-
+) -> (
+    HashMap<String, HashMap<String, OptionModel>>,
+    HashMap<String, HashMap<String, OptionModel>>,
+) {
     let body = client.get(
           &format!("https://api.tdameritrade.com/v1/marketdata/chains?apikey=EXURQJNFBLLVGWUXKZ7N06MWWBKKRKWD&symbol={}&includeQuotes=TRUE", symbol))
           .timeout(core::time::Duration::from_secs(90))
@@ -396,97 +380,150 @@ async fn get_chain_impl(
         })
         .collect();
 
-    // #region IVolatility
-    // let body = client.get(&format!("https://restapi.ivolatility.com/quotes/options?symbol={}&username=dougrussel&password=UsEVO0Ei&mode=RT", symbol))
-    //     .timeout(core::time::Duration::from_secs(90))
-    //     .send()
-    //     .await
-    //     .unwrap()
-    //     .body()
-    //     .limit(1_000_000_000_000)
-    //     .await
-    //     .unwrap();
+    (call_exp_date_map, put_exp_date_map)
+}
 
-    // let mut rdr = csv::Reader::from_reader(&*body);
-    // let mut record_count = 0;
-    // for record in rdr.records() {
-    //     record_count += 1;
-    //     let record = match record {
-    //         Ok(record) => record,
-    //         Err(e) => {
-    //             println!("Bad Record! (1) {:#?}", e);
-    //             continue;
-    //         }
-    //     };
-    //     let record: Result<IVolatilityRecord, csv::Error> = record.deserialize(None);
+async fn get_ivol_chain(
+    spot_price: f32,
+    call_exp_date_map: &mut HashMap<String, HashMap<String, OptionModel>>,
+    put_exp_date_map: &mut HashMap<String, HashMap<String, OptionModel>>,
+    rdr: &mut csv::Reader<&[u8]>,
+) -> i32 {
+    let mut call_exp_date_map = call_exp_date_map;
+    let mut put_exp_date_map = put_exp_date_map;
 
-    //     let record = match record {
-    //         Ok(record) => record,
-    //         Err(e) => {
-    //             println!("Bad Record! (2) {:#?}", e);
-    //             continue;
-    //         }
-    //     };
+    let mut record_count = 0;
+    for record in rdr.records() {
+        record_count += 1;
+        let record = match record {
+            Ok(record) => record,
+            Err(e) => {
+                println!("Bad Record! (1) {:#?}", e);
+                continue;
+            }
+        };
+        let record: Result<IVolatilityRecord, csv::Error> = record.deserialize(None);
 
-    //     let date = record.expirationDate;
-    //     let parsed_date = NaiveDate::parse_from_str(&date, "%Y-%m-%dT%H:%M:%S.%f%z").unwrap();
+        let record = match record {
+            Ok(record) => record,
+            Err(e) => {
+                println!("Bad Record! (2) {:#?}", e);
+                continue;
+            }
+        };
 
-    //     let map = if record.type_ == "C" {
-    //         &mut call_exp_date_map
-    //     } else if record.type_ == "P" {
-    //         &mut put_exp_date_map
-    //     } else {
-    //         println!("Invalid type {}, should be 'C' or 'P'", record.type_);
-    //         continue;
-    //     };
+        let date = record.expiration_date;
+        let parsed_date = NaiveDate::parse_from_str(&date, "%Y-%m-%dT%H:%M:%S.%f%z").unwrap();
+        let strike_string = serde_json::Value::from(record.strike).to_string();
 
-    //     let entry = map
-    //         .entry(parsed_date.format("%Y-%m-%d").to_string())
-    //         .or_insert(HashMap::new());
+        let map = if record.type_ == "C" {
+            &mut call_exp_date_map
+        } else if record.type_ == "P" {
+            &mut put_exp_date_map
+        } else {
+            println!("Invalid type {}, should be 'C' or 'P'", record.type_);
+            continue;
+        };
 
-    //     // TODO(chad)
-    //     let today = chrono::offset::Local::today();
-    //     let t = (parsed_date.num_days_from_ce() as f32 - today.num_days_from_ce() as f32) / 365.0;
+        let entry = map
+            .entry(parsed_date.format("%Y-%m-%d").to_string())
+            .or_insert(HashMap::new());
 
-    //     let volatility = implied_volatility(
-    //         spot_price,
-    //         record.strike as _,
-    //         record.type_ == "C",
-    //         record
-    //             .last_price
-    //             .unwrap_or((record.bid_price + record.ask_price) / 2.0) as _,
-    //         t,
-    //     ) as f64;
+        // TODO(chad)
+        let today = chrono::offset::Local::today();
+        let t = (parsed_date.num_days_from_ce() as f32 - today.num_days_from_ce() as f32) / 365.0;
 
-    //     entry.insert(
-    //         record.strike.to_string(),
-    //         OptionModel {
-    //             bid: Some(record.bid_price),
-    //             ask: Some(record.ask_price),
-    //             last: record.last_price,
-    //             volatility: Some(volatility),
-    //             delta: if record.type_ == "C" {
-    //                 Some(call_delta(
-    //                     spot_price as _,
-    //                     record.strike,
-    //                     volatility,
-    //                     t as _,
-    //                 ))
-    //             } else {
-    //                 Some(put_delta(
-    //                     spot_price as _,
-    //                     record.strike,
-    //                     volatility,
-    //                     t as _,
-    //                 ))
-    //             },
-    //             theta: Some(call_theta(spot_price as _, record.strike, volatility, t as _) / 100.0),
-    //             gamma: Some(0.0),
-    //             vega: Some(0.0),
-    //         },
-    //     );
+        let volatility = implied_volatility(
+            spot_price,
+            record.strike as _,
+            record.type_ == "C",
+            record
+                .last_price
+                .unwrap_or((record.bid_price + record.ask_price) / 2.0) as _,
+            t,
+        ) as f64;
+
+        entry.insert(
+            strike_string,
+            OptionModel {
+                bid: Some(record.bid_price),
+                ask: Some(record.ask_price),
+                last: record.last_price,
+                volatility: Some(volatility),
+                delta: if record.type_ == "C" {
+                    Some(-call_delta(
+                        spot_price as _,
+                        record.strike,
+                        volatility,
+                        t as _,
+                    ))
+                } else {
+                    Some(-put_delta(
+                        spot_price as _,
+                        record.strike,
+                        volatility,
+                        t as _,
+                    ))
+                },
+                theta: Some(call_theta(spot_price as _, record.strike, volatility, t as _) / 100.0),
+                gamma: Some(0.0),
+                vega: Some(0.0),
+            },
+        );
+    }
+
+    record_count
+}
+
+async fn get_chain_impl(
+    symbol: &str,
+    cache: &web::Data<CHashMap<String, ChainResponse>>,
+) -> ChainResponse {
+    // Try to look up the result in the cache
+    match cache.get(symbol) {
+        Some(entry) => {
+            let duration = chrono::offset::Utc::now().naive_utc() - entry.timestamp;
+            if duration < chrono::Duration::minutes(5) {
+                return entry.clone();
+            }
+        }
+        None => {}
+    }
+
+    let client = client::Client::default();
+
+    let spot_price = last_price_for(&client, symbol).await;
+
+    // HashMap<i64, HashMap<F64String, OptionModel>>
+    let mut call_exp_date_map = HashMap::new();
+    let mut put_exp_date_map = HashMap::new();
+
+    let mut ivol_res = client.get(&format!("https://restapi.ivolatility.com/quotes/options?symbol={}&username=dougrussel&password=UsEVO0Ei", symbol))
+        .timeout(core::time::Duration::from_secs(90))
+        .send()
+        .await
+        .unwrap();
+
+    let status = ivol_res.status();
+    if status.is_success() {
+        let body = ivol_res.body().limit(1_000_000_000_000).await.unwrap();
+        let mut rdr = csv::Reader::from_reader(&*body);
+        let record_count = get_ivol_chain(
+            spot_price,
+            &mut call_exp_date_map,
+            &mut put_exp_date_map,
+            &mut rdr,
+        )
+        .await;
+    // println!("For {}: got {} records", symbol, record_count);
+    // if record_count < 100 {
+    //     println!("body: {}", str::from_utf8(&*body).unwrap());
     // }
-    // #endregion
+    } else {
+        let (c, p) = get_tda_chain(&client, symbol).await;
+        call_exp_date_map = c;
+        put_exp_date_map = p;
+    };
 
     let response = ChainResponse {
         symbol: symbol.to_string(),
