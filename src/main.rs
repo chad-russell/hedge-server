@@ -280,22 +280,25 @@ async fn last_price_for(client: &client::Client, symbol: &str) -> f32 {
 async fn get_tda_chain(
     client: &client::Client,
     symbol: &str,
-) -> (
-    HashMap<String, HashMap<String, OptionModel>>,
-    HashMap<String, HashMap<String, OptionModel>>,
-) {
+) -> Result<
+    (
+        HashMap<String, HashMap<String, OptionModel>>,
+        HashMap<String, HashMap<String, OptionModel>>,
+    ),
+    (),
+> {
     let body = client.get(
           &format!("https://api.tdameritrade.com/v1/marketdata/chains?apikey=EXURQJNFBLLVGWUXKZ7N06MWWBKKRKWD&symbol={}&includeQuotes=TRUE", symbol))
           .timeout(core::time::Duration::from_secs(90))
           .send()
           .await
-          .unwrap()
+          .map_err(|_| ())?
           .body()
           .limit(1_000_000_000_000)
           .await
-          .unwrap();
+          .map_err(|_| ())?;
 
-    let response: TDAmeritradeOptionsResponse = serde_json::from_reader(&*body).unwrap();
+    let response: TDAmeritradeOptionsResponse = serde_json::from_reader(&*body).map_err(|_| ())?;
     let put_exp_date_map = response
         .put_exp_date_map
         .iter()
@@ -380,7 +383,7 @@ async fn get_tda_chain(
         })
         .collect();
 
-    (call_exp_date_map, put_exp_date_map)
+    Ok((call_exp_date_map, put_exp_date_map))
 }
 
 async fn get_ivol_chain(
@@ -498,32 +501,37 @@ async fn get_chain_impl(
     let mut call_exp_date_map = HashMap::new();
     let mut put_exp_date_map = HashMap::new();
 
-    let mut ivol_res = client.get(&format!("https://restapi.ivolatility.com/quotes/options?symbol={}&username=dougrussel&password=UsEVO0Ei", symbol))
+    let tda = get_tda_chain(&client, symbol).await;
+    match tda {
+        Ok((c, p)) => {
+            call_exp_date_map = c;
+            put_exp_date_map = p;
+        }
+        _ => {
+            let mut ivol_res = client.get(&format!("https://restapi.ivolatility.com/quotes/options?symbol={}&username=dougrussel&password=UsEVO0Ei", symbol))
         .timeout(core::time::Duration::from_secs(90))
         .send()
         .await
         .unwrap();
 
-    let status = ivol_res.status();
-    if status.is_success() {
-        let body = ivol_res.body().limit(1_000_000_000_000).await.unwrap();
-        let mut rdr = csv::Reader::from_reader(&*body);
-        let record_count = get_ivol_chain(
-            spot_price,
-            &mut call_exp_date_map,
-            &mut put_exp_date_map,
-            &mut rdr,
-        )
-        .await;
-    // println!("For {}: got {} records", symbol, record_count);
-    // if record_count < 100 {
-    //     println!("body: {}", str::from_utf8(&*body).unwrap());
-    // }
-    } else {
-        let (c, p) = get_tda_chain(&client, symbol).await;
-        call_exp_date_map = c;
-        put_exp_date_map = p;
-    };
+            let status = ivol_res.status();
+            if status.is_success() {
+                let body = ivol_res.body().limit(1_000_000_000_000).await.unwrap();
+                let mut rdr = csv::Reader::from_reader(&*body);
+                let _record_count = get_ivol_chain(
+                    spot_price,
+                    &mut call_exp_date_map,
+                    &mut put_exp_date_map,
+                    &mut rdr,
+                )
+                .await;
+                // println!("For {}: got {} records", symbol, record_count);
+                // if record_count < 100 {
+                //     println!("body: {}", str::from_utf8(&*body).unwrap());
+                // }
+            }
+        }
+    }
 
     let response = ChainResponse {
         symbol: symbol.to_string(),
